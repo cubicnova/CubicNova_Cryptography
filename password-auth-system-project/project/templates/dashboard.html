@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard | Secure Auth System</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <div class="dashboard-card">
+    <div class="dashboard-avatar">{{ username[0]|upper }}</div>
+    <h1>Welcome, {{ username }}! 👋</h1>
+    <p class="auth-card__subtitle">You're securely logged in.</p>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert alert-{{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <div class="dashboard-meta">
+      <div class="dashboard-meta__row">
+        <span class="dashboard-meta__label">Username</span>
+        <span class="dashboard-meta__value">{{ username }}</span>
+      </div>
+      <div class="dashboard-meta__row">
+        <span class="dashboard-meta__label">Last Login</span>
+        <span class="dashboard-meta__value">{{ last_login }}</span>
+      </div>
+      <div class="dashboard-meta__row">
+        <span class="dashboard-meta__label">Session Timeout</span>
+        <span class="dashboard-meta__value">30 minutes of inactivity</span>
+      </div>
+    </div>
+
+    <a href="{{ url_for('logout') }}" class="btn btn-secondary" style="display:inline-block; text-decoration:none;">Log Out</a>
+  </div>
+</body>
+</html>
