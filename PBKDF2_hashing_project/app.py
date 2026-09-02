@@ -1,24 +1,26 @@
 """
 app.py
 ------
-Main Flask application: routes, authentication logic, bcrypt password
-hashing/verification, account lockout, session management, and input
-validation.
+Main Flask application: routes, authentication logic, PBKDF2 password
+hashing/verification, account lockout, session management, logging,
+and input validation.
 
 Route map
-    GET/POST  /            -> Home page (redirects based on login state)
+    GET       /            -> Redirects based on login state
     GET/POST  /register    -> Registration page
     GET/POST  /login       -> Login page
     GET       /dashboard   -> Protected dashboard (login required)
     GET       /logout      -> Destroys the session
-
-Run with:  python app.py
 """
 
+import hashlib
+import hmac
+import logging
+import os
 import re
 from datetime import datetime, timedelta
+from functools import wraps
 
-import bcrypt
 import mysql.connector
 from flask import (
     Flask, render_template, request, redirect,
@@ -30,27 +32,27 @@ from mysql.connector import errorcode
 from config import Config
 
 # --------------------------------------------------------------------
-# App setup
+# App setup + logging
 # --------------------------------------------------------------------
 app = Flask(__name__)
 app.config.from_object(Config)
 
-# CSRFProtect automatically validates a csrf_token on every POST/PUT/
-# PATCH/DELETE request submitted via a standard HTML form. Every form
-# in templates/*.html includes {{ csrf_token() }} in a hidden field.
-csrf = CSRFProtect(app)
+# Log to both console and a rotating-free simple file. In production,
+# swap this for a proper handler (RotatingFileHandler, syslog, etc.)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = app.logger
+
+csrf = CSRFProtect(app)  # validates csrf_token on every form POST
 
 
 # --------------------------------------------------------------------
 # Database helpers
 # --------------------------------------------------------------------
 def get_db_connection():
-    """
-    Open a new MySQL connection using credentials from config.py.
-    A fresh connection per request is simple and safe for a learning /
-    small-scale app; for higher traffic, swap this for a connection
-    pool (mysql.connector.pooling.MySQLConnectionPool).
-    """
+    """Open a new MySQL connection using credentials from config.py."""
     return mysql.connector.connect(
         host=app.config["MYSQL_HOST"],
         port=app.config["MYSQL_PORT"],
@@ -61,11 +63,7 @@ def get_db_connection():
 
 
 def get_db():
-    """
-    Store one connection per request on Flask's `g` object so multiple
-    helper functions in the same request reuse it instead of opening
-    several connections.
-    """
+    """One connection per request, stored on Flask's `g` object."""
     if "db" not in g:
         g.db = get_db_connection()
     return g.db
@@ -73,10 +71,53 @@ def get_db():
 
 @app.teardown_appcontext
 def close_db(exception=None):
-    """Automatically close the DB connection at the end of every request."""
     db = g.pop("db", None)
     if db is not None and db.is_connected():
         db.close()
+
+
+# --------------------------------------------------------------------
+# PBKDF2 password hashing helpers
+# --------------------------------------------------------------------
+def generate_salt() -> bytes:
+    """
+    os.urandom() draws from the OS's cryptographically secure random
+    number generator. Each user gets a fresh, unpredictable salt so
+    identical passwords never produce identical stored hashes.
+    """
+    return os.urandom(app.config["PBKDF2_SALT_BYTES"])
+
+
+def hash_password(password: str, salt: bytes) -> bytes:
+    """
+    Derives a key from the password + salt using PBKDF2-HMAC-SHA256,
+    iterated hundreds of thousands of times. The high iteration count
+    is what makes brute-forcing a stolen hash database slow, even
+    though verifying one real login stays fast (a few hundred ms).
+    """
+    return hashlib.pbkdf2_hmac(
+        app.config["PBKDF2_ALGORITHM"],
+        password.encode("utf-8"),
+        salt,
+        app.config["PBKDF2_ITERATIONS"],
+        dklen=app.config["PBKDF2_KEY_LENGTH"],
+    )
+
+
+def verify_password(password: str, salt_hex: str, stored_hash_hex: str) -> bool:
+    """
+    Recomputes the PBKDF2 hash for the submitted password using the
+    user's stored salt, then compares it to the stored hash using
+    hmac.compare_digest() -- a CONSTANT-TIME comparison. A naive `==`
+    comparison exits as soon as it finds a mismatched byte, which can
+    leak timing information an attacker could exploit to guess the
+    hash byte-by-byte. compare_digest() always takes the same amount
+    of time regardless of where (or whether) a mismatch occurs.
+    """
+    salt = bytes.fromhex(salt_hex)
+    stored_hash = bytes.fromhex(stored_hash_hex)
+    candidate_hash = hash_password(password, salt)
+    return hmac.compare_digest(candidate_hash, stored_hash)
 
 
 # --------------------------------------------------------------------
@@ -88,11 +129,11 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 def sanitize_input(value: str) -> str:
     """
-    Basic input sanitization: trims whitespace and strips characters
-    that have no legitimate use in a username/email but are common in
-    injection/XSS payloads. This is a defense-in-depth layer -- the
-    REAL SQL-injection defense is the parameterized queries below, and
-    the real XSS defense is Jinja2's autoescaping in the templates.
+    Trims whitespace and strips characters with no legitimate use in a
+    username/email but common in injection/XSS payloads. This is a
+    defense-in-depth layer -- the actual SQL-injection defense is the
+    parameterized queries below, and the actual XSS defense is Jinja2's
+    autoescaping in the templates.
     """
     if value is None:
         return ""
@@ -111,10 +152,9 @@ def is_valid_email(email: str) -> bool:
 
 def password_strength_errors(password: str) -> list:
     """
-    Server-side password strength validation (mirrors the client-side
-    JS checks in static/js/register.js). We NEVER trust client-side
-    validation alone -- it can be bypassed, so every rule is re-checked
-    here before a password is ever hashed and stored.
+    Server-side password complexity enforcement (mirrors the
+    client-side JS checks). Client-side checks can always be bypassed,
+    so every rule is re-verified here before a password is ever hashed.
     """
     errors = []
     if len(password) < 8:
@@ -133,14 +173,8 @@ def password_strength_errors(password: str) -> list:
 # --------------------------------------------------------------------
 # Auth decorator
 # --------------------------------------------------------------------
-from functools import wraps
-
-
 def login_required(view_func):
-    """
-    Protects a route: if there's no logged-in user in the session,
-    redirect to the login page instead of running the view.
-    """
+    """Redirects to /login if there's no authenticated user in the session."""
     @wraps(view_func)
     def wrapped(*args, **kwargs):
         if "user_id" not in session:
@@ -155,7 +189,6 @@ def login_required(view_func):
 # --------------------------------------------------------------------
 @app.route("/")
 def home():
-    """Landing route: send logged-in users to their dashboard, others to login."""
     if "user_id" in session:
         return redirect(url_for("dashboard"))
     return redirect(url_for("login"))
@@ -166,13 +199,11 @@ def register():
     if request.method == "GET":
         return render_template("register.html")
 
-    # ---- Collect + sanitize input -----------------------------------
     username = sanitize_input(request.form.get("username", ""))
     email = sanitize_input(request.form.get("email", "")).lower()
     password = request.form.get("password", "")
     confirm_password = request.form.get("confirm_password", "")
 
-    # ---- Server-side validation (defense in depth) -------------------
     errors = []
     if not is_valid_username(username):
         errors.append("Username must be 3-30 characters: letters, numbers, underscore only.")
@@ -185,17 +216,11 @@ def register():
     if errors:
         for e in errors:
             flash(e, "error")
-        # Re-render with previously entered (safe) values so the user
-        # doesn't have to retype everything.
         return render_template("register.html", username=username, email=email), 400
 
     db = get_db()
     cursor = db.cursor(dictionary=True)
     try:
-        # Check for existing username/email using a PARAMETERIZED query.
-        # The %s placeholders mean user input is always sent to MySQL as
-        # data, never concatenated into the SQL string -- this is what
-        # prevents SQL injection (e.g. entering `' OR '1'='1`).
         cursor.execute(
             "SELECT id FROM users WHERE username = %s OR email = %s",
             (username, email),
@@ -204,29 +229,31 @@ def register():
             flash("That username or email is already registered.", "error")
             return render_template("register.html", username=username, email=email), 409
 
-        # ---- bcrypt hashing workflow ----------------------------------
-        # 1. bcrypt.gensalt() generates a fresh, random salt (bcrypt
-        #    embeds the salt + cost factor inside the resulting hash
-        #    string itself, so we don't need a separate salt column).
-        # 2. bcrypt.hashpw() combines the salt with the password and
-        #    runs it through the Blowfish-based hash function
-        #    `rounds` times (2^rounds), making brute force expensive.
-        salt = bcrypt.gensalt(rounds=app.config["BCRYPT_ROUNDS"])
-        password_hash = bcrypt.hashpw(password.encode("utf-8"), salt)
+        # ---- PBKDF2 hashing workflow ------------------------------------
+        # 1. Generate a fresh, random 16-byte salt for this user.
+        # 2. Derive a 32-byte key from the password + salt using
+        #    600,000 rounds of HMAC-SHA256 (PBKDF2).
+        # 3. Store the salt and derived key as hex strings -- PBKDF2's
+        #    output does not embed the salt or parameters the way
+        #    bcrypt does, so we must persist the salt ourselves to be
+        #    able to recompute the hash at login time.
+        salt = generate_salt()
+        derived_key = hash_password(password, salt)
 
         cursor.execute(
-            """INSERT INTO users (username, email, password_hash)
-               VALUES (%s, %s, %s)""",
-            (username, email, password_hash.decode("utf-8")),
+            """INSERT INTO users (username, email, password_hash, salt)
+               VALUES (%s, %s, %s, %s)""",
+            (username, email, derived_key.hex(), salt.hex()),
         )
         db.commit()
+        logger.info(f"New user registered: username={username}")
 
     except mysql.connector.Error as err:
         db.rollback()
         if err.errno == errorcode.ER_DUP_ENTRY:
             flash("That username or email is already registered.", "error")
             return render_template("register.html", username=username, email=email), 409
-        app.logger.error(f"Database error during registration: {err}")
+        logger.error(f"Database error during registration: {err}")
         flash("Something went wrong. Please try again later.", "error")
         return render_template("register.html"), 500
     finally:
@@ -251,37 +278,32 @@ def login():
     db = get_db()
     cursor = db.cursor(dictionary=True)
     try:
-        # Parameterized lookup -- safe against SQL injection.
         cursor.execute(
-            """SELECT id, username, password_hash, failed_attempts, locked_until
+            """SELECT id, username, email, password_hash, salt,
+                      failed_attempts, locked_until, created_at, last_login
                FROM users WHERE username = %s OR email = %s""",
             (username, username),
         )
         user = cursor.fetchone()
 
-        # Use one generic error message for "no such user" and "wrong
-        # password" so attackers can't enumerate valid usernames.
+        # Same generic message for "no such user" and "wrong password"
+        # so attackers can't enumerate valid usernames.
         generic_error = "Invalid username or password."
 
         if not user:
+            logger.warning(f"Login attempt for unknown user: {username}")
             flash(generic_error, "error")
             return render_template("login.html", username=username), 401
 
-        # ---- Account lockout check -------------------------------------
+        # ---- Account lockout check ---------------------------------------
         if user["locked_until"] and user["locked_until"] > datetime.now():
             minutes_left = int((user["locked_until"] - datetime.now()).total_seconds() // 60) + 1
             flash(f"Account locked due to too many failed attempts. "
                   f"Try again in {minutes_left} minute(s).", "error")
             return render_template("login.html", username=username), 423
 
-        # ---- bcrypt verification -----------------------------------------
-        # bcrypt.checkpw() re-derives the hash using the SAME salt that
-        # is embedded in the stored hash string, then compares the
-        # result to the stored hash in constant time. We never decrypt
-        # the stored hash (it's one-way) -- we only ever re-hash the
-        # candidate password and compare hashes.
-        stored_hash = user["password_hash"].encode("utf-8")
-        password_ok = bcrypt.checkpw(password.encode("utf-8"), stored_hash)
+        # ---- PBKDF2 verification -------------------------------------------
+        password_ok = verify_password(password, user["salt"], user["password_hash"])
 
         if not password_ok:
             new_failed = user["failed_attempts"] + 1
@@ -294,10 +316,12 @@ def login():
                 )
                 lock_update = ", locked_until = %s"
                 params.append(lock_until)
+                logger.warning(f"Account locked after repeated failures: username={username}")
                 flash("Too many failed attempts. Your account has been "
                       f"locked for {app.config['LOCKOUT_DURATION_MINUTES']} minutes.", "error")
             else:
                 remaining = app.config["MAX_FAILED_LOGIN_ATTEMPTS"] - new_failed
+                logger.warning(f"Failed login attempt for username={username}")
                 flash(f"{generic_error} ({remaining} attempt(s) remaining before lockout)", "error")
 
             params.append(user["id"])
@@ -308,13 +332,8 @@ def login():
             db.commit()
             return render_template("login.html", username=username), 401
 
-        # ---- Successful login: reset lockout counters, record last_login --
-        previous_login_row_cursor = db.cursor(dictionary=True)
-        previous_login_row_cursor.execute(
-            "SELECT last_login FROM users WHERE id = %s", (user["id"],)
-        )
-        previous_login = previous_login_row_cursor.fetchone()["last_login"]
-        previous_login_row_cursor.close()
+        # ---- Successful login ------------------------------------------------
+        previous_last_login = user["last_login"]
 
         cursor.execute(
             """UPDATE users
@@ -323,22 +342,26 @@ def login():
             (datetime.now(), user["id"]),
         )
         db.commit()
+        logger.info(f"Successful login: username={username}")
 
-        # ---- Establish the session ---------------------------------------
-        # Regenerate/clear the session first to prevent session fixation
-        # (never reuse a session identifier a pre-login visitor may have
-        # been assigned).
+        # Prevent session fixation: wipe any pre-login session data and
+        # start a brand-new session identifier.
         session.clear()
         session["user_id"] = user["id"]
         session["username"] = user["username"]
-        session["last_login"] = previous_login.strftime("%Y-%m-%d %H:%M:%S") if previous_login else "First login"
+        session["email"] = user["email"]
+        session["created_at"] = user["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+        session["last_login"] = (
+            previous_last_login.strftime("%Y-%m-%d %H:%M:%S")
+            if previous_last_login else "First login"
+        )
         session.permanent = True  # activates PERMANENT_SESSION_LIFETIME timeout
 
         flash(f"Welcome back, {user['username']}!", "success")
         return redirect(url_for("dashboard"))
 
     except mysql.connector.Error as err:
-        app.logger.error(f"Database error during login: {err}")
+        logger.error(f"Database error during login: {err}")
         flash("Something went wrong. Please try again later.", "error")
         return render_template("login.html"), 500
     finally:
@@ -351,13 +374,17 @@ def dashboard():
     return render_template(
         "dashboard.html",
         username=session.get("username"),
+        email=session.get("email"),
+        created_at=session.get("created_at"),
         last_login=session.get("last_login"),
     )
 
 
 @app.route("/logout")
 def logout():
+    username = session.get("username", "unknown")
     session.clear()
+    logger.info(f"User logged out: username={username}")
     flash("You have been logged out.", "success")
     return redirect(url_for("login"))
 
@@ -372,23 +399,18 @@ def not_found(e):
 
 @app.errorhandler(500)
 def server_error(e):
-    app.logger.error(f"Server error: {e}")
+    logger.error(f"Server error: {e}")
     flash("An unexpected error occurred. Please try again.", "error")
     return render_template("login.html"), 500
 
 
 @app.errorhandler(400)
 def bad_request(e):
-    """
-    Handles rejected requests, including CSRF validation failures
-    raised by Flask-WTF (invalid/missing csrf_token).
-    """
+    """Also catches Flask-WTF CSRF validation failures (invalid/missing token)."""
     flash("Your session expired or the request was invalid. Please try again.", "error")
     return render_template("login.html"), 400
 
 
 if __name__ == "__main__":
-    # debug=True is for local development ONLY -- never run with debug
-    # mode enabled in production (it exposes an interactive debugger
-    # and stack traces to anyone who can trigger an error).
+    # debug=True is for local development ONLY.
     app.run(debug=True, host="127.0.0.1", port=5000)

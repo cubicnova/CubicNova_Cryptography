@@ -3,16 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Login | Secure Auth System</title>
+  <title>Login // Secure Auth</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
   <div class="auth-card">
-    <div class="auth-card__logo">🔐</div>
-    <h1>Welcome Back</h1>
-    <p class="auth-card__subtitle">Log in to your account</p>
+    <div class="auth-card__logo">🛡️</div>
+    <h1>SECURE_LOGIN</h1>
+    <p class="auth-card__subtitle">// authenticate to continue</p>
 
-    <!-- Flash messages (server-side success/error feedback) -->
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
         {% for category, message in messages %}
@@ -22,7 +21,7 @@
     {% endwith %}
 
     <form id="login-form" method="POST" action="{{ url_for('login') }}" novalidate>
-      <!-- CSRF token: required by Flask-WTF's CSRFProtect on every POST -->
+      <!-- CSRF token required by Flask-WTF's CSRFProtect on every POST -->
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
       <div class="form-group">
@@ -61,11 +60,10 @@
     </form>
 
     <p class="auth-footer">
-      Don't have an account? <a href="{{ url_for('register') }}">Create one</a>
+      Don't have an account? <a href="{{ url_for('register') }}">Register</a>
     </p>
   </div>
 
-  <script src="{{ url_for('static', filename='js/common.js') }}"></script>
-  <script src="{{ url_for('static', filename='js/login.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>
