@@ -1,6 +1,7 @@
 import hashlib
 message = "Hello World"
 hash_value = hashlib.sha256(message.encode())
+# hash_value = hashlib.sha1(message.encode())
 print(hash_value.hexdigest())
 
 # Output (SHA-256):
